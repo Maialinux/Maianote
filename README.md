@@ -2,7 +2,7 @@
 
 ## Editor de texto simples feito no python 3.13.3, utilizando o módulo tkinter com customtkinter no Linux.
 
-### Version: 0.1
+## Version: 0.1
 
 ### Author: Luiz Eduardo Maia Ribeiro
 
