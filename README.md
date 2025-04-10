@@ -59,7 +59,7 @@
     
     .\virtual\Scripts\activate -> para windows
 
-### Abra o programa executando o programa main.py
+### Abra o programa executando o main.py
 
     python main.py
     
