@@ -59,6 +59,10 @@
     
     .\virtual\Scripts\activate -> para windows
 
+### Instale os requerimentos:
+
+    pip install -r requerimentos.txt
+
 ### Abra o programa executando o main.py
 
     python main.py
