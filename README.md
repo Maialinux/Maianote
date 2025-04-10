@@ -2,9 +2,11 @@
 
 ## Editor de texto simples feito no python 3.13.3, utilizando o módulo tkinter com customtkinter no Linux.
 
-## Author: Luiz Eduardo Maia Ribeiro
+### Version: 0.1
 
-## channel: @https://www.youtube.com/@l3dpstudios-original
+### Author: Luiz Eduardo Maia Ribeiro
+
+### Channel: https://www.youtube.com/@l3dpstudios-original
 
 
 <br><br>
