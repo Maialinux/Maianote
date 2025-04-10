@@ -1,0 +1,8 @@
+chardet==5.2.0
+customtkinter==5.2.2
+darkdetect==0.8.0
+defusedxml==0.7.1
+fonttools==4.57.0
+packaging==24.2
+pillow==11.1.0
+reportlab==4.3.1

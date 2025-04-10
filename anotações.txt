@@ -1,0 +1,12 @@
+Programa de edição extremamente básico.
+
+Objetivos à alcançar:
+
+1 - Adicionar menu pesquisar.
+    - Função de localizar
+
+2 - Visualizar.
+    - Selecionar Fonte, Tamanho
+    - Esquema de cores -> muda cor de fundo e da letra na caixa de texto e na caixa de números
+    - Habilitar ou Desabilitar os Números das linhas
+
