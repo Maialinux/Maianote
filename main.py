@@ -3,9 +3,16 @@ from customtkinter import CTk, CTkFrame, CTkTextbox, CTkButton, CTkToplevel, CTk
 from tkinter import messagebox
 from PIL import Image
 from reportlab.lib.pagesizes import letter
-from reportlab.lib.styles import getSampleStyleSheet
-from reportlab.platypus import SimpleDocTemplate, Paragraph
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+from xml.sax.saxutils import escape
 import urllib.parse
+import xml.etree.ElementTree as ET
+import zipfile
+import subprocess
+import shutil
 import json
 import sys
 import os
@@ -27,6 +34,9 @@ class MaiaNoteApp(CTk):
         self.geometry("1024x768")
         
         self.current_file_path = None
+        self.ultimo_diretorio = os.path.expanduser("~")
+        self.fontes_ativas = {}   # mantem vivas as fontes das tags (ver fixacao abaixo)
+        self.fontes_pdf = {}      # cache (familia, negrito, italico) -> fonte registrada no reportlab
         self.undo_stack = []
         self.redo_stack = []
         self.max_undo = 25
@@ -36,20 +46,31 @@ class MaiaNoteApp(CTk):
         self.init_icons()
         self.setup_ui()
         self.setup_bindings()
-        self.modo_claro()  # Modo claro inicial padrão
+        self.modo_escuro()  # Modo escuro inicial padrão
         self.save_state()  # Estado inicial
         self.after(200, self.set_favicon)
 
     def set_favicon(self):
+        # No Windows o .ico da o melhor resultado. No X11 o "wm iconbitmap" so
+        # aceita XBM, entao passar um .ico levanta TclError - e, com os dois
+        # formatos no mesmo try, o erro abortava antes de chegar ao PNG e a
+        # janela ficava sem icone nenhum. Os dois caminhos agora sao separados.
+        if sys.platform.startswith("win"):
+            try:
+                ico_path = resource_path("icones/favicon1.ico")
+                if os.path.exists(ico_path):
+                    self.iconbitmap(ico_path)
+            except Exception:
+                pass
+
         try:
-            ico_path = resource_path("icones/favicon1.ico")
             png_path = resource_path("icones/favicon1.png")
-            if os.path.exists(ico_path):
-                self.iconbitmap(ico_path)
             if os.path.exists(png_path):
-                self.favicon = PhotoImage(file=png_path)
-                self.iconphoto(False, self.favicon)
-                self.iconphoto(True, self.favicon)
+                base = PhotoImage(file=png_path)
+                # o favicon tem 16x16, mas barra de tarefas e alt-tab costumam
+                # pedir 32 ou 48; zoom inteiro amplia sem borrar
+                self.favicon = [base, base.zoom(2), base.zoom(3)]
+                self.iconphoto(True, *self.favicon)
         except Exception:
             pass
 
@@ -134,6 +155,14 @@ class MaiaNoteApp(CTk):
         self.menubar.add_cascade(label="Estilizar", menu=self.menuEstilizar)
         self.config(menu=self.menubar)
 
+        # Menu de contexto (botao direito sobre o editor)
+        self.menuContexto = Menu(self, tearoff=0, border=0, borderwidth=0, relief="solid")
+        self.menuContexto.add_command(label="Recortar", command=self.recortar, image=self.icones_light["recortar"], compound=LEFT, accelerator="Ctrl+X")
+        self.menuContexto.add_command(label="Copiar", command=self.copiar, image=self.icones_light["copiar"], compound=LEFT, accelerator="Ctrl+C")
+        self.menuContexto.add_command(label="Colar", command=self.colar, image=self.icones_light["colar"], compound=LEFT, accelerator="Ctrl+V")
+        self.menuContexto.add_separator()
+        self.menuContexto.add_command(label="Selecionar Tudo", command=self.selecionar_tudo, image=self.icones_light["selecionar_tudo"], compound=LEFT, accelerator="Ctrl+A")
+
     def create_toolbar(self):
         self.toolbar = CTkFrame(self, height=40, corner_radius=0)
         self.toolbar.pack(side="top", fill="x", padx=0, pady=0)
@@ -176,6 +205,7 @@ class MaiaNoteApp(CTk):
             height=32, 
             fg_color="transparent",
             hover_color=("#d1d5db", "#374151"),
+            text_color=(tema_claro["preto_1"], tema_escuro["branco_1"]),
             command=self.toggle_tema
         )
         self.btn_tema.pack(side="right", padx=8, pady=4)
@@ -228,7 +258,7 @@ class MaiaNoteApp(CTk):
 
     def sync_scroll_from_textbox(self, *args):
         try:
-            self.caixa_de_texto._v_scrollbar.set(*args)
+            self.caixa_de_texto._y_scrollbar.set(*args)
         except Exception:
             pass
         try:
@@ -270,7 +300,54 @@ class MaiaNoteApp(CTk):
         self.bind("<Control-k>", lambda e: self.change_text_color())
         self.bind("<Control-K>", lambda e: self.change_text_color())
 
+        # O widget Text do tkinter ja traz atalhos proprios (Ctrl+V e Ctrl+Y colam,
+        # Ctrl+X recorta, Ctrl+Z desfaz, Ctrl+O insere quebra de linha, Ctrl+K apaga
+        # ate o fim da linha). Como as ligacoes da janela rodam DEPOIS das da classe
+        # Text, a acao acontecia duas vezes. Ligar no proprio editor e devolver
+        # "break" corta a cadeia antes de o Tk agir por conta propria.
+        def atalho_editor(sequencia, funcao):
+            def tratador(event, funcao=funcao):
+                funcao()
+                return "break"
+            self.caixa_de_texto.bind(sequencia, tratador)
+
+        for tecla, funcao in (
+            ("x", self.recortar), ("c", self.copiar), ("v", self.colar),
+            ("z", self.desfazer), ("y", self.refazer),
+            ("o", self.abrir), ("k", self.change_text_color),
+        ):
+            atalho_editor(f"<Control-{tecla}>", funcao)
+            atalho_editor(f"<Control-{tecla.upper()}>", funcao)
+
+        # Postado no SOLTAR do botao, nao no pressionar: a classe Menu do Tk liga
+        # <ButtonRelease> a tk::MenuInvoke, entao um menu aberto no <Button-3> recebe
+        # o release logo em seguida e se fecha - obrigando a segurar o botao e
+        # arrastar ate o item. Abrindo no release, o menu fica e um clique escolhe.
+        self.caixa_de_texto.bind("<ButtonRelease-3>", self.abre_menu_contexto)
+
         self.protocol("WM_DELETE_WINDOW", self.sair)
+
+    def abre_menu_contexto(self, event):
+        try:
+            self.caixa_de_texto.index(SEL_FIRST)
+            tem_selecao = True
+        except Exception:
+            tem_selecao = False
+        try:
+            tem_area_transferencia = bool(self.clipboard_get())
+        except Exception:
+            tem_area_transferencia = False
+
+        estado_selecao = "normal" if tem_selecao else "disabled"
+        self.menuContexto.entryconfigure("Recortar", state=estado_selecao)
+        self.menuContexto.entryconfigure("Copiar", state=estado_selecao)
+        self.menuContexto.entryconfigure("Colar", state="normal" if tem_area_transferencia else "disabled")
+
+        try:
+            self.menuContexto.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.menuContexto.grab_release()
+        return "break"
 
     def on_key_release(self, event=None):
         self.atualiza_numeros()
@@ -328,6 +405,12 @@ class MaiaNoteApp(CTk):
             # Menu Pesquisar
             self.menuPesquisar.entryconfigure("Localizar e Substituir", image=theme_dict["pesquisar"])
 
+            # Menu de contexto
+            self.menuContexto.entryconfigure("Recortar", image=theme_dict["recortar"])
+            self.menuContexto.entryconfigure("Copiar", image=theme_dict["copiar"])
+            self.menuContexto.entryconfigure("Colar", image=theme_dict["colar"])
+            self.menuContexto.entryconfigure("Selecionar Tudo", image=theme_dict["selecionar_tudo"])
+
             # Menu Estilizar
             self.menuEstilizar.entryconfigure("Fontes e Tamanho", image=theme_dict["fonte"])
             self.menuEstilizar.entryconfigure("Mudar Cor Texto", image=theme_dict["cor"])
@@ -346,6 +429,7 @@ class MaiaNoteApp(CTk):
         self.menuPesquisar.configure(bg=tema_claro["branco_3"], fg=tema_claro["preto_1"], activebackground=tema_claro["branco_2"], activeforeground=tema_claro["preto_1"])
         self.menuEstilizar.configure(bg=tema_claro["branco_3"], fg=tema_claro["preto_1"], activebackground=tema_claro["branco_2"], activeforeground=tema_claro["preto_1"])
         self.submenuEstilizar.configure(bg=tema_claro["branco_3"], fg=tema_claro["preto_1"], activebackground=tema_claro["branco_2"], activeforeground=tema_claro["preto_1"])
+        self.menuContexto.configure(bg=tema_claro["branco_3"], fg=tema_claro["preto_1"], activebackground=tema_claro["branco_2"], activeforeground=tema_claro["preto_1"])
 
         self.toolbar.configure(fg_color=tema_claro["branco_1"])
         self.main_frame.configure(fg_color=tema_claro["branco_1"])
@@ -353,7 +437,7 @@ class MaiaNoteApp(CTk):
         self.statusbar.configure(fg_color=tema_claro["branco_2"])
         
         self.caixa_de_texto.configure(fg_color=tema_claro["branco_3"], text_color=tema_claro["preto_1"], border_color=tema_claro["branco_2"])
-        self.caixa_numeros.configure(fg_color=tema_claro["branco_1"], text_color=tema_claro["preto_2"], border_color=tema_claro["branco_1"])
+        self.caixa_numeros.configure(fg_color=tema_claro["branco_1"], text_color=tema_claro["cinza_1"], border_color=tema_claro["branco_1"])
         self.lbl_pos.configure(text_color=tema_claro["preto_1"])
         self.lbl_stats.configure(text_color=tema_claro["preto_1"])
         self.lbl_encoding.configure(text_color=tema_claro["preto_1"])
@@ -372,6 +456,7 @@ class MaiaNoteApp(CTk):
         self.menuPesquisar.configure(bg=tema_escuro["preto_3"], fg=tema_escuro["branco_1"], activebackground=tema_escuro["branco_2"], activeforeground=tema_escuro["preto_1"])
         self.menuEstilizar.configure(bg=tema_escuro["preto_3"], fg=tema_escuro["branco_1"], activebackground=tema_escuro["branco_2"], activeforeground=tema_escuro["preto_1"])
         self.submenuEstilizar.configure(bg=tema_escuro["preto_3"], fg=tema_escuro["branco_1"], activebackground=tema_escuro["branco_2"], activeforeground=tema_escuro["preto_1"])
+        self.menuContexto.configure(bg=tema_escuro["preto_3"], fg=tema_escuro["branco_1"], activebackground=tema_escuro["branco_2"], activeforeground=tema_escuro["preto_1"])
 
         self.toolbar.configure(fg_color=tema_escuro["preto_3"])
         self.main_frame.configure(fg_color=tema_escuro["preto_3"])
@@ -379,13 +464,84 @@ class MaiaNoteApp(CTk):
         self.statusbar.configure(fg_color=tema_escuro["branco_3"])
 
         self.caixa_de_texto.configure(fg_color=tema_escuro["preto_2"], text_color=tema_escuro["branco_1"], border_color=tema_escuro["preto_2"])
-        self.caixa_numeros.configure(fg_color=tema_escuro["preto_3"], text_color=tema_escuro["branco_2"], border_color=tema_escuro["preto_3"])
+        self.caixa_numeros.configure(fg_color=tema_escuro["preto_3"], text_color=tema_escuro["cinza_1"], border_color=tema_escuro["preto_3"])
         self.lbl_pos.configure(text_color=tema_escuro["branco_1"])
         self.lbl_stats.configure(text_color=tema_escuro["branco_1"])
         self.lbl_encoding.configure(text_color=tema_escuro["branco_1"])
 
         self.update_menu_icons(self.icones_dark)
         self.after(50, self.set_favicon)
+
+    def documento_vazio(self):
+        return not self.caixa_de_texto.get("1.0", "end-1c").strip()
+
+    def diretorio_inicial(self):
+        if self.current_file_path:
+            pasta = os.path.dirname(os.path.abspath(self.current_file_path))
+            if os.path.isdir(pasta):
+                return pasta
+        return self.ultimo_diretorio
+
+    def registra_diretorio(self, file_path):
+        pasta = os.path.dirname(os.path.abspath(file_path))
+        if os.path.isdir(pasta):
+            self.ultimo_diretorio = pasta
+
+    def le_docx(self, file_path):
+        NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+        with zipfile.ZipFile(file_path) as arquivo:
+            raiz = ET.fromstring(arquivo.read("word/document.xml"))
+        paragrafos = []
+        for paragrafo in raiz.iter(NS + "p"):
+            partes = []
+            for no in paragrafo.iter():
+                if no.tag == NS + "t":
+                    partes.append(no.text or "")
+                elif no.tag == NS + "tab":
+                    partes.append("\t")
+                elif no.tag in (NS + "br", NS + "cr"):
+                    partes.append("\n")
+            paragrafos.append("".join(partes))
+        return "\n".join(paragrafos)
+
+    def texto_do_no_odt(self, no, NS):
+        partes = [no.text or ""]
+        for filho in no:
+            if filho.tag == NS + "s":
+                partes.append(" " * int(filho.get(NS + "c", "1")))
+            elif filho.tag == NS + "tab":
+                partes.append("\t")
+            elif filho.tag == NS + "line-break":
+                partes.append("\n")
+            else:
+                partes.append(self.texto_do_no_odt(filho, NS))
+            partes.append(filho.tail or "")
+        return "".join(partes)
+
+    def le_odt(self, file_path):
+        NS = "{urn:oasis:names:tc:opendocument:xmlns:text:1.0}"
+        with zipfile.ZipFile(file_path) as arquivo:
+            raiz = ET.fromstring(arquivo.read("content.xml"))
+        paragrafos = []
+        for no in raiz.iter():
+            if no.tag in (NS + "p", NS + "h"):
+                paragrafos.append(self.texto_do_no_odt(no, NS))
+        return "\n".join(paragrafos)
+
+    def le_doc(self, file_path):
+        # .doc e o formato binario antigo do Word: nao ha como ler so com a
+        # biblioteca padrao. Usa uma ferramenta do sistema, se existir.
+        for programa in ("antiword", "catdoc"):
+            caminho = shutil.which(programa)
+            if caminho:
+                resultado = subprocess.run([caminho, file_path], capture_output=True, timeout=30)
+                if resultado.returncode == 0:
+                    return resultado.stdout.decode("utf-8", errors="replace")
+        raise ValueError(
+            "O formato .doc (Word antigo) e binario e precisa de uma ferramenta "
+            "externa para ser lido.\n\nInstale 'antiword' ou 'catdoc', ou abra o "
+            "arquivo no Word/LibreOffice e salve como .docx, .odt ou .txt."
+        )
 
     def get_text_and_tags(self):
         text_widget = self.caixa_de_texto._textbox
@@ -401,20 +557,25 @@ class MaiaNoteApp(CTk):
                 config = {}
                 font_config = text_widget.tag_cget(tag, "font")
                 if font_config:
-                    if isinstance(font_config, font.Font):
-                        family = font_config.actual('family')
+                    # tag_cget devolve o NOME interno da fonte no Tcl (ex.: "font16"),
+                    # nunca um font.Font. Resolver esse nome recupera os atributos reais;
+                    # sem isso o .mnote gravava "family": "font16" e perdia tamanho,
+                    # negrito, italico, sublinhado e rasurado.
+                    try:
+                        fonte = font.Font(root=text_widget, font=font_config)
+                        family = fonte.actual('family')
                         if not family or family == "TkDefaultFont":
                             family = "Arial"
                         config['font'] = {
                             'family': family,
-                            'size': font_config.actual('size'),
-                            'weight': font_config.actual('weight'),
-                            'slant': font_config.actual('slant'),
-                            'underline': bool(font_config.actual('underline')),
-                            'overstrike': bool(font_config.actual('overstrike'))
+                            'size': int(fonte.actual('size')),
+                            'weight': fonte.actual('weight'),
+                            'slant': fonte.actual('slant'),
+                            'underline': bool(fonte.actual('underline')),
+                            'overstrike': bool(fonte.actual('overstrike'))
                         }
-                    else:
-                        config['font'] = {'family': str(font_config), 'size': 13}
+                    except Exception:
+                        pass
                 foreground = text_widget.tag_cget(tag, "foreground")
                 if foreground:
                     config['foreground'] = foreground
@@ -444,7 +605,9 @@ class MaiaNoteApp(CTk):
                     underline = f.get('underline', False)
                     overstrike = f.get('overstrike', False)
                     
-                    if not family or family == "TkDefaultFont":
+                    if not family or family == "TkDefaultFont" or (
+                            family.startswith("font") and family[4:].isdigit()):
+                        # "fontNN" e lixo gravado pela versao antiga do get_text_and_tags
                         family = "Arial"
                     
                     tk_font = font.Font(
@@ -466,6 +629,12 @@ class MaiaNoteApp(CTk):
             if 'foreground' in config:
                 tag_config['foreground'] = config['foreground']
                 
+            # tkinter.font.Font.__del__ executa "font delete": sem guardar a
+            # referencia, a fonte era destruida assim que a variavel local saia de
+            # escopo e a formatacao sumia logo apos abrir o arquivo.
+            if 'font' in tag_config:
+                self.fontes_ativas[tag_name] = tag_config['font']
+
             text_widget.tag_configure(tag_name, **tag_config)
             for start, end in ranges:
                 text_widget.tag_add(tag_name, start, end)
@@ -485,48 +654,86 @@ class MaiaNoteApp(CTk):
         self.redo_stack.clear()
 
     def novo(self):
-        linha = float(self.caixa_de_texto.index("end-1c"))
-        if self.current_file_path is None and linha >= 1.0:
-            resposta = messagebox.askyesno("Atenção", "Deseja salvar este documento?")
+        if not self.documento_vazio():
+            resposta = messagebox.askyesnocancel("Atenção", "Deseja salvar este documento antes de criar um novo?")
+            if resposta is None:
+                return
             if resposta:
                 self.salvar()
-            else:
-                self.caixa_de_texto.delete("1.0", "end")
-                self.atualiza_numeros()
-                self.update_cursor_status()
-                self.save_state()
+                if self.current_file_path is None:
+                    return   # o usuário cancelou o "Salvar Como"
+
+        self.caixa_de_texto.delete("1.0", "end")
+        for tag in self.caixa_de_texto._textbox.tag_names():
+            if tag != "sel":
+                self.caixa_de_texto._textbox.tag_delete(tag)
+        self.fontes_ativas.clear()
+        self.current_file_path = None
+        self.undo_stack.clear()
+        self.redo_stack.clear()
+        self.atualiza_numeros()
+        self.update_cursor_status()
+        self.save_state()
 
     def abrir(self):
         file_path = filedialog.askopenfilename(
             title="Selecione um arquivo",
             filetypes=(
+                ("Todos os suportados", "*.mnote *.txt *.doc *.docx *.odt"),
                 ("Maianote files", "*.mnote"),
                 ("Text files", "*.txt"),
+                ("Documentos do Word", "*.doc *.docx"),
+                ("OpenDocument", "*.odt"),
                 ("All files", "*.*")
             ),
-            initialdir=os.path.expanduser("~")
+            initialdir=self.diretorio_inicial()
         )
-        if file_path:
-            self.caixa_de_texto.delete("1.0", "end")
-            if file_path.endswith('.mnote'):
-                try:
-                    with open(file_path, "r", encoding="utf-8") as file:
-                        data = json.load(file)
-                        self.apply_tags_to_text(data['text'], data['tags'])
-                        self.atualiza_numeros()
-                        self.update_cursor_status()
-                        self.current_file_path = file_path
-                except Exception as e:
-                    messagebox.showerror("Erro", f"Erro ao carregar arquivo: {str(e)}")
+        if not file_path:
+            return
+
+        extensao = os.path.splitext(file_path)[1].lower()
+        importado = False
+        try:
+            if extensao == ".mnote":
+                with open(file_path, "r", encoding="utf-8") as file:
+                    data = json.load(file)
+                self.apply_tags_to_text(data['text'], data['tags'])
+            elif extensao in (".doc", ".docx", ".odt"):
+                if extensao == ".docx":
+                    texto = self.le_docx(file_path)
+                elif extensao == ".odt":
+                    texto = self.le_odt(file_path)
+                else:
+                    texto = self.le_doc(file_path)
+                self.caixa_de_texto.delete("1.0", "end")
+                self.caixa_de_texto.insert("1.0", texto)
+                importado = True
             else:
-                try:
-                    with open(file_path, "r", encoding="utf-8") as file:
-                        self.caixa_de_texto.insert("end", file.read())
-                        self.atualiza_numeros()
-                        self.update_cursor_status()
-                        self.current_file_path = file_path
-                except Exception as e:
-                    messagebox.showerror("Erro", f"Erro ao carregar arquivo: {str(e)}")
+                with open(file_path, "r", encoding="utf-8") as file:
+                    conteudo = file.read()
+                self.caixa_de_texto.delete("1.0", "end")
+                self.caixa_de_texto.insert("1.0", conteudo)
+        except Exception as e:
+            messagebox.showerror("Erro", f"Erro ao carregar arquivo: {str(e)}")
+            return
+
+        self.registra_diretorio(file_path)
+        # Documentos importados nao viram o arquivo atual: gravar texto puro por
+        # cima de um .doc/.docx/.odt destruiria o original.
+        self.current_file_path = None if importado else file_path
+        self.undo_stack.clear()
+        self.redo_stack.clear()
+        self.atualiza_numeros()
+        self.update_cursor_status()
+        self.save_state()
+
+        if importado:
+            messagebox.showinfo(
+                "Documento importado",
+                f"Texto importado de {os.path.basename(file_path)}.\n\n"
+                "O conteúdo veio como texto puro. Ao salvar, escolha um arquivo "
+                "novo (.mnote ou .txt) para não sobrescrever o original."
+            )
 
     def salvar(self):
         if self.current_file_path:
@@ -547,9 +754,10 @@ class MaiaNoteApp(CTk):
                 ("Text files", "*.txt"),
                 ("All files", "*.*")
             ),
-            initialdir=os.path.expanduser("~")
+            initialdir=self.diretorio_inicial()
         )
         if file_path:
+            self.registra_diretorio(file_path)
             self.current_file_path = file_path
             if file_path.endswith('.mnote'):
                 self.salvar_com_formatacao(file_path)
@@ -568,24 +776,160 @@ class MaiaNoteApp(CTk):
         except Exception as e:
             messagebox.showerror("Erro ao salvar", f"Erro ao salvar arquivo: {str(e)}")
 
+    def cor_hex(self, cor):
+        try:
+            if cor.startswith("#") and len(cor) == 7:
+                return cor
+            r, g, b = self.winfo_rgb(cor)
+            return "#%02x%02x%02x" % (r // 256, g // 256, b // 256)
+        except Exception:
+            return "#000000"
+
+    def caminho_da_fonte(self, family, bold, italic):
+        pedido = family
+        if bold:
+            pedido += ":bold"
+        if italic:
+            pedido += ":italic"
+        try:
+            resultado = subprocess.run(["fc-match", "-f", "%{file}", pedido],
+                                       capture_output=True, text=True, timeout=15)
+            caminho = resultado.stdout.strip()
+            if caminho.lower().endswith((".ttf", ".otf")) and os.path.exists(caminho):
+                return caminho
+        except Exception:
+            pass
+        return None
+
+    def fonte_para_pdf(self, family, bold, italic):
+        # O reportlab so conhece 14 fontes basicas; para as demais e preciso registrar o
+        # arquivo TTF. O fontconfig (fc-match) localiza o arquivo da familia pedida.
+        chave = (family, bold, italic)
+        if chave in self.fontes_pdf:
+            return self.fontes_pdf[chave]
+
+        nome = None
+        caminho = self.caminho_da_fonte(family, bold, italic)
+        if caminho:
+            candidato = f"mn_fonte_{len(self.fontes_pdf)}"
+            try:
+                pdfmetrics.registerFont(TTFont(candidato, caminho))
+                nome = candidato
+            except Exception:
+                nome = None
+
+        if nome is None:
+            minusculo = family.lower()
+            if "mono" in minusculo or "courier" in minusculo or "consol" in minusculo:
+                base, sufixos = "Courier", ("", "-Bold", "-Oblique", "-BoldOblique")
+            elif "serif" in minusculo or "times" in minusculo or "georgia" in minusculo:
+                base, sufixos = "Times", ("-Roman", "-Bold", "-Italic", "-BoldItalic")
+            else:
+                base, sufixos = "Helvetica", ("", "-Bold", "-Oblique", "-BoldOblique")
+            nome = base + sufixos[(1 if bold else 0) + (2 if italic else 0)]
+
+        self.fontes_pdf[chave] = nome
+        return nome
+
+    def trechos_formatados(self):
+        """Percorre o texto e devolve (trecho, estilo) para cada pedaco homogeneo."""
+        tw = self.caixa_de_texto._textbox
+        ordem = [t for t in tw.tag_names() if t != "sel"]   # ordem de prioridade do Tk
+
+        familia_padrao = self.current_font.cget("family") or "Arial"
+        try:
+            tamanho_padrao = abs(int(self.current_font.cget("size")))
+        except Exception:
+            tamanho_padrao = 13
+
+        def estilo(tags):
+            especificacao, cor = None, None
+            for t in ordem:
+                if t in tags:
+                    valor_fonte = tw.tag_cget(t, "font")
+                    if valor_fonte:
+                        especificacao = valor_fonte
+                    valor_cor = tw.tag_cget(t, "foreground")
+                    if valor_cor:
+                        cor = valor_cor
+            dados = {"family": familia_padrao, "size": tamanho_padrao,
+                     "bold": False, "italic": False,
+                     "underline": False, "overstrike": False,
+                     "cor": self.cor_hex(cor) if cor else "#000000"}
+            if especificacao:
+                try:
+                    fonte = font.Font(root=tw, font=especificacao)
+                    dados["family"] = fonte.actual("family") or familia_padrao
+                    dados["size"] = abs(int(fonte.actual("size"))) or tamanho_padrao
+                    dados["bold"] = fonte.actual("weight") == "bold"
+                    dados["italic"] = fonte.actual("slant") == "italic"
+                    dados["underline"] = bool(fonte.actual("underline"))
+                    dados["overstrike"] = bool(fonte.actual("overstrike"))
+                except Exception:
+                    pass
+            return dados
+
+        ativos = set()
+        trechos = []
+        for tipo, valor, _ in tw.dump("1.0", "end-1c", tag=True, text=True):
+            if tipo == "text":
+                trechos.append((valor, estilo(ativos)))
+            elif tipo == "tagon":
+                ativos.add(valor)
+            elif tipo == "tagoff":
+                ativos.discard(valor)
+        return trechos
+
     def exportar_pdf(self):
-        texto = self.caixa_de_texto.get("1.0", "end-1c")
-        if not texto.strip():
+        if self.documento_vazio():
             messagebox.showwarning("Aviso", "Erro: O texto está vazio!")
             return
 
         caminho_arquivo = filedialog.asksaveasfilename(
             defaultextension=".pdf",
-            filetypes=[("Arquivos PDF", "*.pdf"), ("Todos os arquivos", "*.*")]
+            filetypes=[("Arquivos PDF", "*.pdf"), ("Todos os arquivos", "*.*")],
+            initialdir=self.diretorio_inicial()
         )
         if not caminho_arquivo:
             return
+        self.registra_diretorio(caminho_arquivo)
 
         try:
+            # Quebra os trechos em linhas: um Paragraph por linha preserva as
+            # quebras, que o reportlab colapsaria se o texto fosse um bloco unico.
+            linhas = [[]]
+            for trecho, est in self.trechos_formatados():
+                pedacos = trecho.split("\n")
+                for i, pedaco in enumerate(pedacos):
+                    if i > 0:
+                        linhas.append([])
+                    if pedaco:
+                        linhas[-1].append((pedaco, est))
+
+            estilo_base = getSampleStyleSheet()["Normal"]
+            conteudo = []
+            for linha in linhas:
+                if not linha:
+                    conteudo.append(Spacer(1, estilo_base.fontSize * 1.35))
+                    continue
+                marcado = []
+                maior = 0
+                for pedaco, est in linha:
+                    nome = self.fonte_para_pdf(est["family"], est["bold"], est["italic"])
+                    maior = max(maior, est["size"])
+                    fragmento = escape(pedaco)
+                    if est["underline"]:
+                        fragmento = f"<u>{fragmento}</u>"
+                    if est["overstrike"]:
+                        fragmento = f"<strike>{fragmento}</strike>"
+                    marcado.append(
+                        f'<font name="{nome}" size="{est["size"]}" color="{est["cor"]}">{fragmento}</font>'
+                    )
+                estilo_linha = ParagraphStyle("linha", parent=estilo_base,
+                                              fontSize=maior, leading=maior * 1.35)
+                conteudo.append(Paragraph("".join(marcado), estilo_linha))
+
             pdf = SimpleDocTemplate(caminho_arquivo, pagesize=letter)
-            styles = getSampleStyleSheet()
-            paragrafo = Paragraph(texto, style=styles["Normal"])
-            conteudo = [paragrafo]
             pdf.build(conteudo)
             messagebox.showinfo("PDF Exportado", f"PDF exportado com sucesso para:\n{caminho_arquivo}")
         except Exception as e:
@@ -769,6 +1113,7 @@ class MaiaNoteApp(CTk):
         overstrike_str = "1" if overstrike else "0"
         tag_name = f"font_{safe_family}_{size}_{weight_str}_{slant_str}_{underline_str}_{overstrike_str}"
         
+        self.fontes_ativas[tag_name] = tk_font   # mantem a fonte viva (ver apply_tags_to_text)
         self.caixa_de_texto._textbox.tag_configure(tag_name, font=tk_font)
         self.caixa_de_texto._textbox.tag_add(tag_name, sel_start, sel_end)
         self.save_state()

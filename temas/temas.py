@@ -5,7 +5,8 @@ tema_claro = {
     "preto_1": "#1e293b",
     "preto_2": "#475569",
     "preto_3": "#f1f5f9",
-    "azul_1": "#2563eb"
+    "azul_1": "#2563eb",
+    "cinza_1": "#475569"
 }
 
 tema_escuro = {
@@ -15,5 +16,6 @@ tema_escuro = {
     "preto_1": "#f8fafc",
     "preto_2": "#181825",
     "preto_3": "#1e1e2e",
-    "azul_1": "#3b82f6"
+    "azul_1": "#3b82f6",
+    "cinza_1": "#94a3b8"
 }
