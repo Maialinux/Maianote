@@ -1,6 +1,6 @@
 # Maianote
 
-## Editor de texto simples feito no python 3.14.6, utilizando o módulo tkinter com customtkinter no Linux.
+## Editor de texto simples feito no python 3.13.5, utilizando o módulo tkinter com customtkinter no Linux.
 
 ## Version: 1.0.0
 
