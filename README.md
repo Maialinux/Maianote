@@ -6,7 +6,7 @@
 
 ### Author: Luiz Eduardo Maia Ribeiro
 
-### Channel: https://www.youtube.com/@l3dpstudios-original
+### Channel: (https://www.youtube.com/@maiastudiospro)
 
 
 <br><br>
