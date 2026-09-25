@@ -5,7 +5,7 @@ set -e
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$PROJECT_DIR"
 
-VENV="$PROJECT_DIR/.venv_linux"
+VENV="$PROJECT_DIR/venv"
 PY_VER="$("$VENV/bin/python" -c 'import sys; print(f"python{sys.version_info.major}.{sys.version_info.minor}")')"
 CTK_DIR="$VENV/lib/$PY_VER/site-packages/customtkinter"
 
