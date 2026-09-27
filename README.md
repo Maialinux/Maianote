@@ -11,7 +11,7 @@
 
 <br><br>
 
-<p align="left">
+<p align="left" style="background-color:#f7f7f7">
 
   <img src="imagens/logoMaia.png">
 
